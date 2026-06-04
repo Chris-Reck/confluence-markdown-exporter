@@ -74,6 +74,7 @@ StrPath: TypeAlias = str | PathLike[str]
 
 logger = logging.getLogger(__name__)
 _MAX_UNICODE_CODEPOINT = 0x10FFFF
+_PAGES_WITH_EXPORTED_CHILDREN: set[int] = set()
 
 _RE_RGB_BG = re.compile(r"background-color:\s*rgb\((\d+),\s*(\d+),\s*(\d+)\)")
 _RE_RGB_COLOR = re.compile(r"(?<![a-z-])color:\s*rgb\((\d+),\s*(\d+),\s*(\d+)\)")
@@ -114,6 +115,26 @@ _LOZENGE_COLORS: dict[str, str] = {
     "aui-lozenge-error": "#ffd5d2",  # red
     "aui-lozenge-progress": "#dfd8fd",  # purple / violet
 }
+
+
+def _build_parent_page_id_set(pages: list["Page | Descendant"]) -> set[int]:
+    """Return page IDs that have at least one exported child page.
+
+    A page is considered a parent when any other page in the export batch lists
+    it in its ancestor chain.
+    """
+    return {int(ancestor.id) for page in pages for ancestor in page.ancestors}
+
+
+def _to_index_path(path: Path) -> Path:
+    """Convert a file path like ``Section.md`` to ``Section/index.md``.
+
+    If the path already points to an index file, it is returned unchanged.
+    """
+    if path.stem == "index":
+        return path
+    suffix = path.suffix or ".md"
+    return path.with_suffix("") / f"index{suffix}"
 
 
 def _require_dict(response: object, context: str) -> JsonResponse:
@@ -829,7 +850,13 @@ class Descendant(Document):
     @property
     def export_path(self) -> Path:
         filepath_template = Template(settings.export.page_path.replace("{", "${"))
-        return Path(filepath_template.safe_substitute(self._template_vars))
+        path = Path(filepath_template.safe_substitute(self._template_vars))
+        if (
+            getattr(settings.export, "page_indexes_for_parents", False)
+            and int(self.id) in _PAGES_WITH_EXPORTED_CHILDREN
+        ):
+            return _to_index_path(path)
+        return path
 
     @classmethod
     def from_json(cls, data: JsonResponse, base_url: str) -> "Descendant":
@@ -937,7 +964,13 @@ class Page(Document):
     @property
     def export_path(self) -> Path:
         filepath_template = Template(settings.export.page_path.replace("{", "${"))
-        return Path(filepath_template.safe_substitute(self._template_vars))
+        path = Path(filepath_template.safe_substitute(self._template_vars))
+        if (
+            getattr(settings.export, "page_indexes_for_parents", False)
+            and int(self.id) in _PAGES_WITH_EXPORTED_CHILDREN
+        ):
+            return _to_index_path(path)
+        return path
 
     @property
     def html(self) -> str:
@@ -1006,7 +1039,6 @@ class Page(Document):
             conv.markdown,
         )
         self._marked_texts: dict[str, str] = conv._marked_texts
-
 
     _COMMENT_TITLE_MAX_LEN = 60
 
@@ -1659,40 +1691,48 @@ class Page(Document):
             return "\n\n" + tabulate(table_data, headers=["", ""], tablefmt="pipe") + "\n"
 
         def convert_alert(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
-            """Convert Confluence info macros to Markdown GitHub style alerts.
-
-            GitHub specific alert types: https://docs.github.com/en/get-started/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax#alerts
-
-            Inside table cells GitHub alerts don't render in most viewers
-            (Obsidian, etc.), so emit a leading emoji + plain text instead.
-            """
+            """Convert Confluence info macros to MkDocs Material Admonitions."""
             alert_type_map = {
-                "info": "IMPORTANT",
-                "panel": "NOTE",
-                "tip": "TIP",
-                "note": "WARNING",
-                "warning": "CAUTION",
-            }
-            alert_emoji_map = {
-                "NOTE": "\U0001f4dd",
-                "TIP": "\U0001f4a1",
-                "IMPORTANT": "❗",
-                "WARNING": "⚠️",
-                "CAUTION": "\U0001f6d1",
+                "info": "info",
+                "panel": "example",
+                "tip": "tip",
+                "note": "note",
+                "warning": "warning",
             }
 
-            alert_type = alert_type_map.get(str(el["data-macro-name"]), "NOTE")
+            alert_emoji_map = {
+                "note": "📝",
+                "tip": "💡",
+                "info": "ℹ️",
+                "success": "✅",
+                "question": "❓",
+                "warning": "⚠️",
+                "failure": "❌",
+                "danger": "⛔",
+                "bug": "🐞",
+                "example": "📌",
+                "quote": "💬",
+            }
+
+            raw_type = str(el.get("data-macro-name"))
+            alert_type = alert_type_map.get(raw_type, "note")
 
             macro_id = el.get("data-macro-id")
             custom_emoji = self._panel_icon_map.get(str(macro_id)) if macro_id else None
             emoji = custom_emoji or alert_emoji_map[alert_type]
 
-            tags = parent_tags if isinstance(parent_tags, list | set) else set()
-            if "td" in tags or "th" in tags:
-                return f"{emoji} {text.strip()}"
+            tags = set(parent_tags) if isinstance(parent_tags, (list, set)) else set()
 
-            blockquote = super().convert_blockquote(el, text, parent_tags)
-            return f"\n> [!{alert_type}]{blockquote}"
+            content = text.strip()
+
+            if "td" in tags or "th" in tags:
+                return f"**{emoji} {content}**"  # Dont render admonition in table cells, just prepend the emoji to the text and make it bold (MkDocs Material doesn't support admonitions (without html) in tables)
+
+            indented_content = "\n".join(
+                "    " + line if line.strip() else "" for line in content.splitlines()
+            )
+
+            return f"\n\n!!! {alert_type}\n{indented_content}\n\n"
 
         def convert_div(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
             # Handle Confluence macros
@@ -1878,14 +1918,19 @@ class Page(Document):
         def convert_column_layout(
             self, el: BeautifulSoup, text: str, parent_tags: list[str]
         ) -> str:
-            cells = el.find_all("div", {"class": "cell"})
+            cells = el.find_all("div", {"class": "cell"}, recursive=False)
 
-            if len(cells) < 2:  # noqa: PLR2004
-                return super().convert_div(el, text, parent_tags)
+            if len(cells) > 2:
+                print(
+                    f"Test-Warning: {len(cells)} Columns converted at once"
+                )  # TODO remove after testing
 
-            html = f"<table><tr>{''.join([f'<td>{cell!s}</td>' for cell in cells])}</tr></table>"
+            converted_cells = [self.process_tag(cell, parent_tags) for cell in cells]
 
-            return self.convert_table(BeautifulSoup(html, "html.parser"), text, parent_tags)
+            # left = left.replace("\n", "<br>")
+            # right = right.replace("\n", "<br>")
+
+            return "\n---\n".join(converted_cells)
 
         def convert_jira_table(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
             jira_tables = BeautifulSoup(self.page.body_export, "html.parser").find_all(
@@ -2029,10 +2074,11 @@ class Page(Document):
                     if match := parse_confluence_path(parsed_href.path):
                         if match.page_id:
                             return self.convert_page_link(match.page_id)
-            if (href := href_str).startswith("#"):
+            if href_str.startswith("#"):
                 if settings.export.page_href == "wiki":
                     return f"[[#{text}]]"
-                return f"[{text}](#{github_heading_slug(href[1:])})"
+
+                return f"[{text}](#{github_heading_slug(text)})"
 
             return super().convert_a(el, text, parent_tags)
 
@@ -2694,7 +2740,7 @@ class Page(Document):
 
             parent_match = re.search(r'parent\s*=\s*"?(\d+)"?', cql, re.IGNORECASE)
             current_content_match = re.search(
-                r'(?:ancestor|parent)\s*=\s*currentContent\s*\(\s*\)', cql, re.IGNORECASE
+                r"(?:ancestor|parent)\s*=\s*currentContent\s*\(\s*\)", cql, re.IGNORECASE
             )
 
             from_clause: str | None = None
@@ -2889,6 +2935,8 @@ def export_pages(pages: list["Page | Descendant"]) -> None:
     LockfileManager.mark_seen([p.id for p in pages])
     for p in pages:
         PageTitleRegistry.register(int(p.id), p.title)
+    _PAGES_WITH_EXPORTED_CHILDREN.clear()
+    _PAGES_WITH_EXPORTED_CHILDREN.update(_build_parent_page_id_set(pages))
     pages_to_export = [page for page in pages if LockfileManager.should_export(page)]
 
     skipped_count = len(pages) - len(pages_to_export)
