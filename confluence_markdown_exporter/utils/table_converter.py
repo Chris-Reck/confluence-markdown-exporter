@@ -181,12 +181,13 @@ class TableConverter(MarkdownConverter):
                 return ""
             return f'<a id="{github_heading_slug(heading)}"></a> **{heading}**<br>'
 
-        convert_hN_fn = getattr(MarkdownConverter, "convert_hN", None) or getattr(
+        convert_hn_fn = getattr(MarkdownConverter, "convert_hN", None) or getattr(
             MarkdownConverter, "convert_hn", None
         )
-        if callable(convert_hN_fn):
-            return cast("str", convert_hN_fn(self, 1, el, text, tags))
+        if callable(convert_hn_fn):
+            # Page title is already emitted as H1; content headings must start at H2.
+            return cast("str", convert_hn_fn(self, 2, el, text, tags))
 
         if not heading:
             return ""
-        return f"\n\n# {heading}\n\n"
+        return f"\n\n## {heading}\n\n"

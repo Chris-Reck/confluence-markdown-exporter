@@ -1474,6 +1474,8 @@ class Page(Document):
             super().__init__(**options)
             self.page = page
             self.page_properties = {}
+            self._did_emit_page_title_h1 = False
+            self._did_skip_duplicate_title_h1 = False
             self._marked_texts: dict[str, str] = {}
             self._colorid_map_cache: dict[str, str] | None = None
             self._image_captions_cache: dict[str, str] | None = None
@@ -1694,6 +1696,64 @@ class Page(Document):
             for key, value in props.items():
                 if value:
                     self.page_properties[sanitize_key(key)] = value
+
+        def _is_leading_duplicate_page_title_h1(
+            self, el: BeautifulSoup, heading: str, page_title: str
+        ) -> bool:
+            """Return True only for a duplicate title H1 at the very top of the document."""
+            if not isinstance(el, Tag):
+                return False
+
+            for prev in el.previous_elements:
+                if isinstance(prev, NavigableString):
+                    if self._normalize_unicode_whitespace(str(prev)).strip():
+                        return False
+                    continue
+
+                if isinstance(prev, Tag):
+                    name = str(prev.name or "").lower()
+                    if name in {"html", "body", "[document]"}:
+                        continue
+
+                    if name == "h1":
+                        prev_heading = self._normalize_unicode_whitespace(prev.get_text()).strip()
+                        return prev_heading == page_title and heading == page_title
+
+                    # Ignore empty wrapper tags while checking document start.
+                    if not self._normalize_unicode_whitespace(prev.get_text()).strip():
+                        continue
+                    return False
+
+            return False
+
+        def convert_h1(
+            self, el: BeautifulSoup, text: str, parent_tags: "TableConverter.ParentTags | bool"
+        ) -> str:
+            tags = self._normalize_parent_tags(parent_tags)
+            heading = self._normalize_unicode_whitespace(text).strip()
+            page_title = self._normalize_unicode_whitespace(self.page.title).strip()
+
+            if settings.export.include_document_title and heading and heading == page_title:
+                # Keep exactly one page title as H1. Any duplicate source-title H1 is removed.
+                if not self._did_emit_page_title_h1:
+                    self._did_emit_page_title_h1 = True
+                    convert_hn_fn = getattr(MarkdownConverter, "convert_hN", None) or getattr(
+                        MarkdownConverter, "convert_hn", None
+                    )
+                    if callable(convert_hn_fn):
+                        return cast("str", convert_hn_fn(self, 1, el, text, tags))
+                    return f"\n\n# {heading}\n\n"
+
+                if (
+                    not self._did_skip_duplicate_title_h1
+                    and not ({"td", "th", "table"} & set(tags))
+                    and self._is_leading_duplicate_page_title_h1(el, heading, page_title)
+                ):
+                    self._did_skip_duplicate_title_h1 = True
+                    return ""
+
+            # All other H1 headings in page content are downgraded to H2 by TableConverter.
+            return super().convert_h1(el, text, tags)
 
         def convert_page_properties(
             self, el: BeautifulSoup, text: str, parent_tags: list[str]
