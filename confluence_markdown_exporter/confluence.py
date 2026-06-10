@@ -1573,6 +1573,9 @@ class Page(Document):
         @property
         def front_matter(self) -> str:
             indent = self.options["front_matter_indent"]
+
+            self.page_properties["title"] = self.page.title
+
             self.set_page_properties(tags=self.labels)
             self._add_confluence_url_properties()
             self._add_page_metadata_properties()
