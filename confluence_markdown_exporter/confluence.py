@@ -28,6 +28,7 @@ import yaml
 from atlassian.errors import ApiError
 from atlassian.errors import ApiNotFoundError
 from bs4 import BeautifulSoup
+from bs4 import NavigableString
 from bs4 import Tag
 from markdownify import ATX
 from markdownify import MarkdownConverter
@@ -1588,6 +1589,52 @@ class Page(Document):
             yml = re.sub(r"^( *)(- )", r"\1" + " " * indent + r"\2", yml, flags=re.MULTILINE)
             return f"---\n{yml}\n---\n"
 
+        def _maybe_add_space_after_inline_link(self, el: BeautifulSoup, markdown: str) -> str:
+            """Add a missing space after inline links if the next HTML node starts with text.
+
+            This fixes cases like:
+            <a>Modus Messen</a><span>können</span>
+            -> [Modus Messen](...) können
+
+            It does not add a space before punctuation.
+            """
+            next_node = el.next_sibling
+
+            while next_node is not None:
+                if isinstance(next_node, NavigableString):
+                    text = self._normalize_unicode_whitespace(str(next_node))
+                    if not text:
+                        next_node = next_node.next_sibling
+                        continue
+
+                    # If the original next text already starts with whitespace, do nothing.
+                    if text[0].isspace():
+                        return markdown
+
+                    # Do not insert space before punctuation.
+                    if text[0] in ".,;:!?)]}»”’":
+                        return markdown
+
+                    return markdown + " "
+
+                if isinstance(next_node, Tag):
+                    text = self._normalize_unicode_whitespace(next_node.get_text())
+                    if not text:
+                        next_node = next_node.next_sibling
+                        continue
+
+                    if text[0].isspace():
+                        return markdown
+
+                    if text[0] in ".,;:!?)]}»”’":
+                        return markdown
+
+                    return markdown + " "
+
+                break
+
+            return markdown
+
         def _add_confluence_url_properties(self) -> None:
             mode = settings.export.confluence_url_in_frontmatter
             if mode == "none":
@@ -1849,6 +1896,8 @@ class Page(Document):
             return f'<mark style="background: {bg};">{text.strip()}</mark>'
 
         def convert_span(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:  # noqa: C901, PLR0911
+            text = self._normalize_unicode_whitespace(text)
+
             if el.has_attr("data-macro-name"):
                 if el["data-macro-name"] == "jira":
                     return self.convert_jira_issue(el, text, parent_tags)
@@ -2051,14 +2100,17 @@ class Page(Document):
             if "page" in str(el.get("data-linked-resource-type")):
                 page_id = str(el.get("data-linked-resource-id", ""))
                 if page_id and page_id != "null":
-                    return self.convert_page_link(int(page_id))
+                    link = self.convert_page_link(int(page_id))
+                    return self._maybe_add_space_after_inline_link(el, link)
             if "attachment" in str(el.get("data-linked-resource-type")):
                 link = self.convert_attachment_link(el, text, parent_tags)
+                link = link or f"[{text}]({el.get('href')})"
                 # convert_attachment_link may return None if the attachment meta is incomplete
-                return link or f"[{text}]({el.get('href')})"
+                return self._maybe_add_space_after_inline_link(el, link)
             href_str = str(el.get("href", ""))
             if href_str and (attachment := self._attachment_from_download_href(href_str)):
-                return self._format_attachment_link(attachment)
+                link = self._format_attachment_link(attachment)
+                return self._maybe_add_space_after_inline_link(el, link)
             if href_str:
                 parsed_href = urlparse(href_str)
                 base_host = urlparse(getattr(self.page, "base_url", "") or "").hostname
@@ -2081,9 +2133,11 @@ class Page(Document):
                 if settings.export.page_href == "wiki":
                     return f"[[#{text}]]"
 
-                return f"[{text}](#{github_heading_slug(text)})"
+                link = f"[{text}](#{github_heading_slug(text)})"
+                return self._maybe_add_space_after_inline_link(el, link)
 
-            return super().convert_a(el, text, parent_tags)
+            link = super().convert_a(el, text, parent_tags)
+            return self._maybe_add_space_after_inline_link(el, link)
 
         def convert_page_link(self, page_id: int) -> str:
             if not page_id:
@@ -2924,6 +2978,165 @@ def _export_page_worker(page: "Page | Descendant", stats: ExportStats | None = N
         stats.inc_exported()
 
 
+def _page_nav_path(page: "Page | Descendant") -> str:
+    """Return the exported Markdown path in MkDocs nav format."""
+    return page.export_path.as_posix()
+
+
+def _page_parent_id(page: "Page | Descendant") -> int | None:
+    """Return the direct Confluence parent id, if it is known."""
+    if not page.ancestors:
+        return None
+    return int(page.ancestors[-1].id)
+
+
+def _fetch_direct_child_order(parent: "Page | Descendant") -> list[int]:
+    """Fetch direct child-page order from Confluence.
+
+    The CQL descendant query used for discovery does not reliably preserve the
+    page tree order shown in Confluence. The child endpoint returns only direct
+    children and, on Confluence, follows the configured child-page order. If the
+    endpoint is unavailable, callers can safely fall back to the original export
+    order or title/path sorting.
+    """
+    client = get_thread_confluence(parent.base_url)
+    results: list[int] = []
+    path = f"rest/api/content/{int(parent.id)}/child/page"
+    params: dict[str, object] | None = {
+        "limit": 200,
+        "expand": "version",
+    }
+
+    while path:
+        response = cast("dict", client.get(path, params=params))
+        for item in response.get("results", []):
+            try:
+                results.append(int(item["id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        next_path = response.get("_links", {}).get("next")
+        path = str(next_path) if next_path else ""
+        params = None
+
+    return results
+
+
+def _build_child_order_map(pages: list["Page | Descendant"]) -> dict[int, dict[int, int]]:
+    """Return {parent_id: {child_id: position}} based on Confluence child order."""
+    page_ids = {int(page.id) for page in pages}
+    parent_ids = {_page_parent_id(page) for page in pages}
+    parent_ids.discard(None)
+
+    pages_by_id = {int(page.id): page for page in pages}
+    order_map: dict[int, dict[int, int]] = {}
+
+    for parent_id in sorted(pid for pid in parent_ids if pid in page_ids):
+        parent = pages_by_id[parent_id]
+        try:
+            ordered_child_ids = [
+                cid for cid in _fetch_direct_child_order(parent) if cid in page_ids
+            ]
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Could not fetch Confluence child order for page id=%s. Falling back to stable sorting.",
+                parent_id,
+            )
+            continue
+
+        if ordered_child_ids:
+            order_map[parent_id] = {child_id: pos for pos, child_id in enumerate(ordered_child_ids)}
+
+    return order_map
+
+
+def _sort_nav_pages(
+    pages: list["Page | Descendant"],
+    parent_id: int | None,
+    child_order_map: dict[int, dict[int, int]],
+    input_order: dict[int, int],
+) -> list["Page | Descendant"]:
+    """Sort nav pages by Confluence order, then by original export order/title/path."""
+    order_for_parent = child_order_map.get(parent_id or -1, {})
+
+    def sort_key(page: "Page | Descendant") -> tuple[int, int, str, str]:
+        page_id = int(page.id)
+        confluence_pos = order_for_parent.get(page_id, 10**9)
+        original_pos = input_order.get(page_id, 10**9)
+        return (confluence_pos, original_pos, page.title.casefold(), _page_nav_path(page))
+
+    return sorted(pages, key=sort_key)
+
+
+def _build_nav_item(
+    page: "Page | Descendant",
+    children_by_parent: dict[int | None, list["Page | Descendant"]],
+    child_order_map: dict[int, dict[int, int]],
+    input_order: dict[int, int],
+) -> dict[str, object]:
+    """Build one MkDocs nav item recursively.
+
+    Pages with children are written as sections. The page itself is inserted as
+    the first section item, which works well with MkDocs Material's
+    `navigation.indexes` feature when pages are exported as `index.md` files.
+    """
+    children = _sort_nav_pages(
+        children_by_parent.get(int(page.id), []),
+        int(page.id),
+        child_order_map,
+        input_order,
+    )
+
+    if not children:
+        return {page.title: _page_nav_path(page)}
+
+    section_items: list[object] = [_page_nav_path(page)]
+    for child in children:
+        section_items.append(
+            _build_nav_item(child, children_by_parent, child_order_map, input_order)
+        )
+
+    return {page.title: section_items}
+
+
+def export_nav_yml(pages: list["Page | Descendant"]) -> None:
+    """Export the Confluence page hierarchy as `.nav.yml` for MkDocs."""
+    if not pages:
+        return
+
+    page_ids = {int(page.id) for page in pages}
+    input_order = {int(page.id): idx for idx, page in enumerate(pages)}
+    children_by_parent: dict[int | None, list[Page | Descendant]] = {}
+
+    for page in pages:
+        parent_id = _page_parent_id(page)
+        if parent_id not in page_ids:
+            parent_id = None
+        children_by_parent.setdefault(parent_id, []).append(page)
+
+    child_order_map = _build_child_order_map(pages)
+    root_pages = _sort_nav_pages(
+        children_by_parent.get(None, []),
+        None,
+        child_order_map,
+        input_order,
+    )
+
+    nav = {
+        "nav": [
+            _build_nav_item(page, children_by_parent, child_order_map, input_order)
+            for page in root_pages
+        ]
+    }
+
+    nav_path = settings.export.output_path / ".nav.yml"
+    save_file(
+        nav_path,
+        yaml.dump(nav, allow_unicode=True, sort_keys=False, default_flow_style=False),
+    )
+    logger.info("Created .nav.yml with %d root page(s).", len(root_pages))
+
+
 def export_pages(pages: list["Page | Descendant"]) -> None:
     """Export a list of Confluence pages to Markdown.
 
@@ -2952,6 +3165,7 @@ def export_pages(pages: list["Page | Descendant"]) -> None:
 
     if not pages_to_export:
         logger.info("All %d page(s) unchanged — nothing to export.", len(pages))
+        export_nav_yml(pages)
         return
 
     # Get worker count from config
@@ -2992,3 +3206,5 @@ def export_pages(pages: list["Page | Descendant"]) -> None:
                         stats.inc_failed()
                     finally:
                         progress.advance(task)
+
+    export_nav_yml(pages)
