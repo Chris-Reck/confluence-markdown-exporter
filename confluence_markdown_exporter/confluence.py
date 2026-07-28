@@ -2108,16 +2108,21 @@ class Page(Document):
             if not text:
                 return ""
 
-            code_language = ""
-            if el.has_attr("data-syntaxhighlighter-params"):
-                match = re.search(r"brush:\s*([^;]+)", str(el["data-syntaxhighlighter-params"]))
-                if match:
-                    code_language = match.group(1)
+            # Strip HTML tags from code blocks: convert <br> to newlines, remove all other tags.
+            # Replace any form of br tag with actual newlines
+            cleaned_text = re.sub(r'<br\s*/?>', '\n', text)
+            # Remove all remaining HTML tags
+            cleaned_text = re.sub(r'<[^>]+>', '', cleaned_text)
 
-            if "@startuml" in text:
-                code_language = "plantuml"
+            # Markdown tables cannot safely contain multiline fenced code blocks.
+            # Render pre blocks inside table cells as a single inline code span.
+            tags = parent_tags if isinstance(parent_tags, list | set) else set()
+            if "table" in tags or "td" in tags or "th" in tags:
+                inline_code = cleaned_text.strip().replace("\n", r"\n")
+                inline_code = inline_code.replace("`", r"\`")
+                return f"`{inline_code}`"
 
-            return f"\n\n```{code_language}\n{text}\n```\n\n"
+            return f"\n\n```\n{cleaned_text}\n```\n\n"
 
         def convert_sub(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
             return f"<sub>{text}</sub>"

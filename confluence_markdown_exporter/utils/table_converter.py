@@ -61,6 +61,7 @@ def make_empty_cell() -> Tag:
 
 def _normalize_table_cell_text(text: str) -> str:
     text = text.replace("|", "\\|").replace("\n", "<br/>")
+
     text = _LEADING_BR_OR_WS.sub("", text)
     return _TRAILING_BR_OR_WS.sub("", text)
 
@@ -94,7 +95,9 @@ class TableConverter(MarkdownConverter):
         if has_header:
             return tabulate(converted[1:], headers=converted[0], tablefmt="pipe")
 
-        return tabulate(converted, headers=[""] * len(converted[0]), tablefmt="pipe")
+        # Keep Markdown table compatibility without injecting a blank header row.
+        # For headerless HTML tables, promote the first row as the markdown header.
+        return tabulate(converted[1:], headers=converted[0], tablefmt="pipe")
 
     def convert_th(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
         """This method is empty because we want a No-Op for the <th> tag."""
