@@ -3,6 +3,7 @@
 - Fixed Heading slugs so intra page links work
 - Fixed Github-style Admonitions, using mkdocs-material admonitions instead
 - Made Parent pages export as index.md in theis respective subfolders. This works with the navigation.indexes setting of mkdocs.
+- Replaced H1 in tables with "html anchor" + "bold text" + "br" 
 
 <p align="center">
   <a href="https://github.com/Spenhouet/confluence-markdown-exporter"><img src="https://raw.githubusercontent.com/Spenhouet/confluence-markdown-exporter/b8caaba935eea7e7017b887c86a740cb7bf99708/logo.png" alt="confluence-markdown-exporter"></a>
